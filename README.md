@@ -1,7 +1,7 @@
 # ansible-update-amis
 Ansible Playbook to update AWS AMI and replace it in the auto-scaling group
 
-Often times in small AWS environments, there is a need to keep up with the updates on hosts that are in the auot-scalling groups.
+Often times in small AWS environments, there is a need to keep up with the updates on hosts that are in the auto-scalling groups.
 While you can do this via userdata yum update command, often times these images need to be changed and updated with other things too.
 
 This handy ansible playbook will do just that for you. It is intended to run on your Ansible server that will have access to AWS.
