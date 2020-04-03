@@ -9,7 +9,7 @@ It will look for your latest AMI, launch a temporary instance, add this instance
 Finally it will create a new launch configuration with this new AMI, update Auto Scalling group to use it (without replacing existing instances) and delete the old launch configuration. 
 
 Ansible needs to have awscli installed with the right IAM privileges (ec2 full admin, S3 getobject from Config Bucket).
-EC2 moduels in Ansible also depend upon boto3 python library (pip install boto3).
+EC2 moduls in Ansible also need boto3 python library.
 
 Script looks up your AMIs based on tags. It is intended to have AMI's with tags images:latest , images:1 and images:2 for the last 3 versions of your AMI. It will automatically delete the last AMI (images:3) and update tags on other ones so as to keep 3 copies.
 
