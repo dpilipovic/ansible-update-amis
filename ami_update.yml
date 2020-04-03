@@ -1,0 +1,232 @@
+-
+  name:  update-ami-playbook
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+# Edit variables here:
+  vars:
+    temp_instance_sg_group_id: sg-000000000000
+    temp_instance_vpc_subnet_id: subnet-000000000
+    instance_region: us-east-1
+    instance_key: testing
+    instance_type: t2.micro
+    s3_userdata_path: s3://dev-config-bucket/userdata/
+    userdata_script: userdata.sh
+    instance_sg: [ TestingSG ]
+    instance_asg: Testing ASG
+    instance_lc: TestingLC
+    image_name: TestImage
+
+# End of variables section
+
+  tasks:
+
+  - name:
+    shell: aws ec2 describe-images --filters "Name=tag:images,Values=latest" --query 'Images[*].{ID:ImageId}' --output text
+    register: ami_id
+
+  - debug:
+      msg: "{{ ami_id.stdout }}"
+
+# Launch an instance with ami_id gathered from last step
+  - name: create temporary ec2 instance
+    ec2:
+      key_name: "{{ instance_key }}"
+      instance_type: "{{ instance_type }}"
+      image: "{{ ami_id.stdout }}"
+      wait: yes
+      group_id: "{{ temp_instance_sg_group_id }}"
+      region: "{{ instance_region }}"
+      vpc_subnet_id: "{{ temp_instance_vpc_subnet_id }}"
+      instance_tags:
+         Name: temp_image
+      count: 1
+    register: ec2
+
+  - debug: var=ec2
+
+  - name: Register private IP
+    shell: "echo {{ ec2.instances[0].private_ip }}"
+    register: ip
+
+  - debug: var=ip.stdout
+
+  - name: Register Instance ID
+    shell: "echo {{ ec2.instances[0].id }}"
+    register: instanceid
+
+  - debug: var=instanceid.stdout
+
+  - name: Make vars persistant
+    set_fact:
+      myinstance: "{{ ip.stdout }}"
+      myid: "{{ instanceid.stdout }}"
+      instance_region: "{{ instance_region }}"
+      s3_userdata_path: "{{ s3_userdata_path }}"
+      userdata_script: "{{ userdata_script }}"
+      instance_sg: "{{ instance_sg }}"
+      instance_asg: "{{ instance_asg }}"
+      instance_lc: "{{ instance_lc }}"
+      instance_key: "{{ instance_key }}"
+      instance_type: "{{ instance_type }}"
+      image_name: "{{ image_name }}"
+
+  - name: Add new Instance to host group
+    add_host: name={{ item.private_ip }} groups="images"
+    with_items: "{{ ec2.instances }}"
+
+  - name: Wait for SSH to come up
+    wait_for: host={{ item.private_ip }} port=22 delay=60 timeout=320 state=started
+    with_items: "{{ ec2.instances }}"
+
+
+##############################################################################
+#                                                                            #
+#      NOW UPDATE TEMPORARY INSTANCE                                         #
+#                                                                            #
+##############################################################################
+
+-
+  name: Update temporary instance
+  hosts: "{{ hostvars['localhost']['myinstance'] }}"
+  tasks:
+    - name: update the system
+      yum:
+        name: "*"
+        state: latest
+
+#    - name: command
+#      shell: grep RootPassword /etc/ssh/sshd_config
+#      register: output
+
+#    - debug:
+#        msg: "{{ output.stdout }}"
+
+##############################################################################
+#                                                                            #
+#         BACK TO LOCALHOST                                                  #
+#                                                                            #
+##############################################################################
+
+-
+  name:  update-ami-playbook part 2
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+
+  - debug: var=myid
+  - debug: var=myinstance
+
+  - name: Stop updated temporary instance that were previously launched
+    ec2:
+      state: stopped
+      region: "{{ instance_region }}"
+      instance_ids: "{{ myid }}"
+      wait: yes
+
+
+  - name: Get timestamp from the system
+    shell: date +%Y%m%d%H%M
+    register: timestamp
+
+  - debug: var=timestamp.stdout
+
+  - name: Take a new AMI from temporary instance
+    ec2_ami:
+      instance_id: "{{ myid }}"
+      wait: yes
+      name: {{ image_name + ' ' + timestamp.stdout }}
+      tags:
+        images: updated
+
+  - name: Terminate instances that were previously launched
+    ec2:
+      state: absent
+      region: "{{ instance_region }}"
+      instance_ids: "{{ myid }}"
+
+  - name: Find and rotate AMI tags
+    shell: aws ec2 describe-images --filters "Name=tag:images,Values=2" --query 'Images[*].{ID:ImageId}' --output text
+    register: ami_delete
+
+  - name: Find and rotate AMI tags
+    shell: aws ec2 describe-images --filters "Name=tag:images,Values=1" --query 'Images[*].{ID:ImageId}' --output text
+    register: ami_tomove2
+
+  - name: Find and rotate AMI tags
+    shell: aws ec2 describe-images --filters "Name=tag:images,Values=latest" --query 'Images[*].{ID:ImageId}' --output text
+    register: ami_tomove1
+
+  - name: Find and rotate AMI tags
+    shell: aws ec2 describe-images --filters "Name=tag:images,Values=updated" --query 'Images[*].{ID:ImageId}' --output text
+    register: ami_current
+
+  - name: Delete oldest AMI
+    ec2_ami:
+      image_id: "{{ ami_delete.stdout }}"
+      delete_snapshot: True
+      state: absent
+
+  - name: Rotate AMI tags
+    shell: aws ec2 create-tags --resources "{{ ami_tomove2.stdout }}" --tags Key=images,Value=2
+
+  - name: Rotate AMI tags
+    shell: aws ec2 create-tags --resources "{{ ami_tomove1.stdout }}" --tags Key=images,Value=1
+
+  - name: Rotate AMI tags
+    shell: aws ec2 create-tags --resources "{{ ami_current.stdout }}" --tags Key=images,Value=latest
+
+#
+#  Create new Launch Configuration with the latest AMI
+#
+
+  - name: Lookup existing LC
+    ec2_lc_find:
+      name_regex: "{{ instance_lc + '*' }}"
+      region: "{{ instance_region }}"
+      sort_order: descending
+      limit: 1
+    register: lc
+
+  - debug:
+      msg: "{{ lc }}"
+
+  - name: Register LC name
+    shell: "echo {{ lc.results[0].name }}"
+    register: oldlcname
+
+  - debug: var=oldlcname.stdout
+
+  - name: Obtain userdata script from S3
+    shell: aws s3 cp {{ s3_userdata_path }}{{ ansible_userdata }} .
+
+  - name: Register new LC name
+    shell: "echo {{ instance_lc }} {{ timestamp.stdout }}"
+    register: newlcname
+
+  - debug: var=newlcname.stdout
+
+  - name: Create new Launch Configuration
+    ec2_lc:
+      region: "{{ instance_region }}"
+      name: "{{ newlcname.stdout }}"
+      image_id: "{{ ami_current.stdout }}"
+      security_groups: "{{ instance_sg }}"
+      instance_type: "{{ instance_type }}"
+      key_name: "{{ instance_key }}"
+      user_data_path: "{{ playbook_dir + '/' +  userdata_script }}"
+      volumes:
+      - device_name: /dev/sda1
+        volume_size: 30
+        volume_type: gp2
+        delete_on_termination: true
+        encrypted: true
+
+  - name: Update AutoScalling group with new LC
+    shell: aws autoscaling update-auto-scaling-group --auto-scaling-group-name "{{ instance_asg }}" --launch-configuration-name "{{ newlcname.stdout }}"
+
+  - name: Delete old Launch configuration
+    shell: aws autoscaling delete-launch-configuration --launch-configuration-name "{{ oldlcname.stdout }}"
